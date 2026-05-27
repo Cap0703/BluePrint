@@ -556,19 +556,16 @@ function requireRole(role) {
  * @param {express.NextFunction} next
  */
 function redirectIfNotAuthenticated(req, res, next) {
+  // Let the client-side auth.js handle redirection.
+  // The server still verifies session if present (e.g. for scanner/app logins),
+  // but won't loop-redirect for browser clients using localStorage tokens.
   const token = req.session.user?.token || req.headers.authorization?.split(' ')[1];
-  
-  if (!token) {
-    return res.redirect('/login');
+  if (token) {
+    try {
+      req.user = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    } catch (_) {}
   }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
-    req.user = decoded;
-    next();
-  } catch (err) {
-    return res.redirect('/login');
-  }
+  next(); // Always serve the page — auth.js will redirect if no valid token
 }
 
 
