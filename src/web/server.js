@@ -2381,6 +2381,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       courses: Array.isArray(user.courses) ? user.courses : [],
       token: token
     };
+    req.session.user = { token };
     res.json({ 
       message: 'Login successful',
       token: token,

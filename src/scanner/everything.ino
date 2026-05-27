@@ -1,6 +1,7 @@
-#include <PN532_I2C.h>
 #include <WiFi.h>
+#include <PN532_I2C.h>
 #include <HTTPClient.h>
+#include <EEPROM.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #include "FS.h"
@@ -10,43 +11,11 @@
 #include <Adafruit_PN532.h>
 #include <Wire.h>
 #include <WebSocketsClient.h>
-
-#define FINGERPRINT_LED_YELLOW 0x05
-#define FINGERPRINT_LED_CYAN 0x06
-#define FINGERPRINT_LED_WHITE 0x07
-
-// ========== CONFIGURATION ==========
-//const char ssid[] = "NETGEAR54TP-Link_003Ext";
-//const char password[] = "PIN12205486";
-//const char ssid[] = "NETGEAR54";
-//const char password[] = "silentbird445";
-const char ssid[] = "BraveWeb";
-const char password[] = "Br@veW3b";
-
-WebSocketsClient webSocket;
-
-const char* SCANNER_ID = "1";
-const char* SCANNER_LOCATION = "304";
-const char* SCANNER_PASSWORD = "BluePrint";
-
-const char* serverEndpoint = "https://blueprint.boo";
-const char* wsHost = "blueprint.boo";
-const uint16_t wsPort = 443;
-const char* wsPath = "/ws";
-
-const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = -8 * 3600;
-const int daylightOffset_sec = 3600;
-
-const int batteryPin = 34;
-
-const float R1 = 38600.0;
-const float R2 = 20870.0;
-
-int count = 0;
-
-float calibrationFactor = 4.138 / 5.605;
-const float VREF = 3.378;
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include "esp_bt.h"
 
 // ========== LED STATE MACHINE ==========
 enum LedState {
@@ -56,45 +25,142 @@ enum LedState {
   LED_SCANNER_OFFLINE,         // CYAN Breathing (No WiFi, Scanner mode) - 10 sec
   LED_ENROLL_CONNECTED,        // YELLOW Breathing (WiFi+WS, Enroll mode) - 10 sec
   LED_ENROLL_OFFLINE,          // YELLOW Breathing (No WiFi, Enroll mode) - 10 sec
-  LED_SUCCESS                  // GREEN Breathing (override) - 1 sec
+  LED_SUCCESS                  // GREEN Solid (override) - 250ms
 };
 
 // ========== LED PHASE TIMING ==========
-const unsigned long LED_ERROR_DURATION = 2000;    // 2 seconds for RED/WHITE error states
-const unsigned long LED_MODE_DURATION = 10000;    // 10 seconds for mode breathing states
-const unsigned long LED_SUCCESS_DURATION = 250;  // 1 second for green success
+const unsigned long LED_ERROR_DURATION   = 2000;
+const unsigned long LED_MODE_DURATION    = 10000;
+const unsigned long LED_SUCCESS_DURATION = 250;
 
 enum LedPhase {
-  PHASE_CHECK_ERROR,    // Check for WiFi/WS errors (show RED or WHITE if needed)
-  PHASE_SHOW_MODE,      // Show mode-based LED (BLUE/YELLOW/CYAN breathing)
-  PHASE_SUCCESS         // Show GREEN success (when overridden)
+  PHASE_CHECK_ERROR,
+  PHASE_SHOW_MODE,
+  PHASE_SUCCESS
 };
 
-// ========== LED MANAGEMENT GLOBALS ==========
-LedState currentLedState = LED_DISCONNECTED_WIFI;
-LedPhase currentPhase = PHASE_CHECK_ERROR;
-unsigned long phaseStartTime = 0;
-bool successOverrideActive = false;
-unsigned long successOverrideUntil = 0;
+#define EEPROM_SIZE 512
 
+// ========== R503 Aura LED Constants ==========
+#ifndef FINGERPRINT_LED_RED
+#define FINGERPRINT_LED_RED      0x01
+#endif
+#ifndef FINGERPRINT_LED_BLUE
+#define FINGERPRINT_LED_BLUE     0x02
+#endif
+#ifndef FINGERPRINT_LED_PURPLE
+#define FINGERPRINT_LED_PURPLE   0x03
+#endif
+#ifndef FINGERPRINT_LED_GREEN
+#define FINGERPRINT_LED_GREEN    0x04
+#endif
+#ifndef FINGERPRINT_LED_YELLOW
+#define FINGERPRINT_LED_YELLOW   0x05
+#endif
+#ifndef FINGERPRINT_LED_CYAN
+#define FINGERPRINT_LED_CYAN     0x06
+#endif
+#ifndef FINGERPRINT_LED_WHITE
+#define FINGERPRINT_LED_WHITE    0x07
+#endif
+
+#ifndef FINGERPRINT_LED_BREATHING
+#define FINGERPRINT_LED_BREATHING   0x01
+#endif
+#ifndef FINGERPRINT_LED_FLASHING
+#define FINGERPRINT_LED_FLASHING    0x02
+#endif
+#ifndef FINGERPRINT_LED_ON
+#define FINGERPRINT_LED_ON          0x03
+#endif
+#ifndef FINGERPRINT_LED_OFF
+#define FINGERPRINT_LED_OFF         0x04
+#endif
+#ifndef FINGERPRINT_LED_GRADUAL_ON
+#define FINGERPRINT_LED_GRADUAL_ON  0x05
+#endif
+#ifndef FINGERPRINT_LED_GRADUAL_OFF
+#define FINGERPRINT_LED_GRADUAL_OFF 0x06
+#endif
+
+// ========== WEBSOCKET ==========
+WebSocketsClient webSocket;
+
+// ========== CONFIG ==========
+struct Config {
+  char ssid[32];
+  char password[32];
+  char scanner_id[32];
+  char scanner_pass[32];
+  char scanner_loc[32];
+} config;
+
+void saveConfig() {
+  EEPROM.put(0, config);
+  EEPROM.commit();
+}
+
+void loadConfig() {
+  EEPROM.get(0, config);
+  if (strlen(config.ssid) == 0) {
+    strcpy(config.ssid,        "BraveWeb");
+    strcpy(config.password,    "Br@veW3b");
+    strcpy(config.scanner_id,  "1");
+    strcpy(config.scanner_pass,"BluePrint");
+    strcpy(config.scanner_loc, "304");
+  }
+}
+
+// ========== SERVER / WS ENDPOINTS ==========
+const char*    serverEndpoint = "https://blueprint.boo";
+const char*    wsHost         = "blueprint.boo";
+const uint16_t wsPort         = 443;
+const char*    wsPath         = "/ws";
+
+// ========== NTP ==========
+const char* ntpServer        = "pool.ntp.org";
+const long  gmtOffset_sec    = -8 * 3600;
+const int   daylightOffset_sec = 3600;
+
+// ========== BATTERY ==========
+const int   batteryPin        = 34;
+const float R1                = 38600.0;
+const float R2                = 20870.0;
+float       calibrationFactor = 4.138 / 5.605;
+const float VREF              = 3.378;
+
+// ========== LED GLOBALS ==========
+LedState     currentLedState      = LED_DISCONNECTED_WIFI;
+LedPhase     currentPhase         = PHASE_CHECK_ERROR;
+unsigned long phaseStartTime      = 0;
+bool          successOverrideActive = false;
+unsigned long successOverrideUntil  = 0;
+
+// ========== CONNECTIVITY GLOBALS ==========
 bool websocketConnected = false;
+bool WifiConnected      = false;
+String authToken   = "";
+String scannerDbId = "";
+String mode        = "scanner";  // "scanner" | "enroll"
 
 // ========== FINGERPRINT HARDWARE ==========
 #define RX_GPIO 16
 #define TX_GPIO 17
-HardwareSerial mySerial(2);
+HardwareSerial       mySerial(2);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+bool fingerprintInitialized = false;
 
 // ========== NFC HARDWARE ==========
 #define PN532_IRQ   -1
 #define PN532_RESET -1
-
 Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET);
+bool           nfcInitialized = false;
+unsigned long  lastNFCCheck   = 0;
+const unsigned long NFC_CHECK_INTERVAL = 200;
 
-// ========== SD HARDWARE ==========
-
+// ========== OFFLINE LOG ==========
 #define OFFLINE_LOGS_FILE "/offline_logs.bin"
-#define MAX_OFFLINE_LOGS 200
+#define MAX_OFFLINE_LOGS  200
 
 struct OfflineLog {
   int  studentID;
@@ -107,205 +173,50 @@ struct OfflineLog {
   char nfcDate[11];
 };
 
-#define BUTTON_PIN 25
-unsigned long buttonPressStart = 0;
-bool buttonLastState = HIGH;
-bool buttonPressed = false;
-
-const unsigned long SHORT_PRESS_TIME = 50;     // debounce threshold
-const unsigned long LONG_PRESS_TIME  = 1500;   // 1.5 seconds
-
-// ========== GLOBALS ==========
-String authToken = "";
-String scannerDbId = "";
-String mode = "scanner";  // scanner, enroll, nfc
-bool WifiConnected = false;
-bool fingerprintInitialized = false;
-bool nfcInitialized = false;
+// ========== STUDENT MAP ==========
+#define MAX_FINGERPRINT_SLOTS 127
+#define STUDENTS_BIN          "/students.bin"
+int students[MAX_FINGERPRINT_SLOTS + 1] = {0};
 
 // ========== ENROLLMENT CONTROL ==========
-bool enrollmentActive = false;
+bool enrollmentActive    = false;
 bool enrollmentCancelled = false;
-int enrollmentStudentID = 0;
+int  enrollmentStudentID = 0;
 
-//log pending
+// ========== PENDING LOG ==========
 struct PendingLog {
-  int studentID;
+  int  studentID;
   char method[16];
   bool pending;
 };
 PendingLog pendingLog = {0, "", false};
 
-// Virtual fingerprint mapping: slot -> student ID
-#define MAX_FINGERPRINT_SLOTS 127
-#define STUDENTS_BIN "/students.bin"
-#define FINGERPRINT_LED_GREEN 0x04
+// ========== BUTTON ==========
+#define BUTTON_PIN 25
+unsigned long buttonPressStart = 0;
+bool          buttonLastState  = HIGH;
+bool          buttonPressed    = false;
 
-unsigned long lastNFCCheck = 0;
-const unsigned long NFC_CHECK_INTERVAL = 200; // ms
+const unsigned long SHORT_PRESS_TIME = 50;    // debounce
+const unsigned long LONG_PRESS_TIME  = 1500;  // 1.5 sec  → reconnect/reauth
+const unsigned long BLE_PRESS_TIME   = 5000;  // 5 sec    → enable BLE
 
-int students[MAX_FINGERPRINT_SLOTS + 1] = {0};
-
-// ========== LED CONTROL FUNCTIONS ==========
-void setLedColor(LedState state) {
-  if (!fingerprintInitialized) return;
-
-  uint8_t color = FINGERPRINT_LED_RED;
-  uint8_t mode = FINGERPRINT_LED_BREATHING;
-  uint16_t speed = 3000;
-  
-  switch (state) {
-    // ERROR STATES (Solid)
-    case LED_DISCONNECTED_WIFI:
-      color = FINGERPRINT_LED_RED;
-      mode = FINGERPRINT_LED_ON;
-      finger.LEDcontrol(mode, 0, color);
-      break;
-      
-    case LED_DISCONNECTED_WS:
-      color = FINGERPRINT_LED_WHITE;
-      mode = FINGERPRINT_LED_ON;
-      finger.LEDcontrol(mode, 0, color);
-      break;
-    
-    // MODE STATES (Breathing)
-    case LED_SCANNER_CONNECTED:
-      color = FINGERPRINT_LED_BLUE;
-      finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 3000, color);
-      break;
-      
-    case LED_SCANNER_OFFLINE:
-      color = FINGERPRINT_LED_CYAN;
-      finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 1500, color);
-      break;
-      
-    case LED_ENROLL_CONNECTED:
-      color = FINGERPRINT_LED_YELLOW;
-      finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 3000, color);
-      break;
-    
-    case LED_SUCCESS:
-      color = FINGERPRINT_LED_GREEN;
-      mode = FINGERPRINT_LED_ON;
-      finger.LEDcontrol(mode, 0, color);
-      break;
-      
-    default:
-      color = FINGERPRINT_LED_RED;
-      finger.LEDcontrol(FINGERPRINT_LED_ON, 0, color);
-      break;
-  }
-}
-
-void setLedSuccess() {
-  if (!fingerprintInitialized) return;
-  successOverrideActive = true;
-  successOverrideUntil = millis() + LED_SUCCESS_DURATION;
-  currentLedState = LED_SUCCESS;
-  currentPhase = PHASE_SUCCESS;
-  setLedColor(LED_SUCCESS);
-}
-
-LedState getDesiredModeState() {
-  // Determine which LED state based on WiFi/WS connectivity and mode
-  if (WifiConnected && websocketConnected) {
-    // Both connected: use bright, steady colors
-    if (mode == "enroll") {
-      return LED_ENROLL_CONNECTED;
-    } else {
-      return LED_SCANNER_CONNECTED;
-    }
-  } else if (WifiConnected && !websocketConnected) {
-    // WiFi only (WS error): will be handled by PHASE_CHECK_ERROR
-    return LED_DISCONNECTED_WS;
-  } else {
-    // No WiFi: use offline colors
-    if (mode == "enroll") {
-      return LED_ENROLL_OFFLINE;
-    } else {
-      return LED_SCANNER_OFFLINE;
-    }
-  }
-}
-
-void updateLedStatus() {
-  if (!fingerprintInitialized) return;
-
-  unsigned long now = millis();
-
-  // ========== HANDLE SUCCESS OVERRIDE ==========
-  if (successOverrideActive) {
-    if (now >= successOverrideUntil) {
-      // Success period over, return to normal cycle
-      successOverrideActive = false;
-      currentPhase = PHASE_CHECK_ERROR;
-      phaseStartTime = now;
-    }
-    // Continue showing green breathing
-    return;
-  }
-
-  // ========== PHASE MACHINE ==========
-  
-  if (currentPhase == PHASE_CHECK_ERROR) {
-    // Check for WiFi or WebSocket errors
-    if (!WifiConnected) {
-      // No WiFi: show RED solid for 2 seconds
-      if (currentLedState != LED_DISCONNECTED_WIFI) {
-        currentLedState = LED_DISCONNECTED_WIFI;
-        setLedColor(LED_DISCONNECTED_WIFI);
-        phaseStartTime = now;
-      }
-      
-      if (now - phaseStartTime >= LED_ERROR_DURATION) {
-        // Error time over, move to mode phase
-        currentPhase = PHASE_SHOW_MODE;
-        phaseStartTime = now;
-      }
-    } 
-    else if (WifiConnected && !websocketConnected) {
-      // WiFi connected but WebSocket down: show WHITE solid for 2 seconds
-      if (currentLedState != LED_DISCONNECTED_WS) {
-        currentLedState = LED_DISCONNECTED_WS;
-        setLedColor(LED_DISCONNECTED_WS);
-        phaseStartTime = now;
-      }
-      
-      if (now - phaseStartTime >= LED_ERROR_DURATION) {
-        // Error time over, move to mode phase
-        currentPhase = PHASE_SHOW_MODE;
-        phaseStartTime = now;
-      }
-    } 
-    else if (WifiConnected && websocketConnected) {
-      // No errors, skip error phase and go straight to mode
-      currentPhase = PHASE_SHOW_MODE;
-      phaseStartTime = now;
-    }
-  }
-  
-  else if (currentPhase == PHASE_SHOW_MODE) {
-    // Show mode-based LED (breathing)
-    LedState desiredMode = getDesiredModeState();
-    
-    if (currentLedState != desiredMode) {
-      currentLedState = desiredMode;
-      setLedColor(desiredMode);
-      phaseStartTime = now;
-    }
-    
-    if (now - phaseStartTime >= LED_MODE_DURATION) {
-      // Mode time over, return to error checking
-      currentPhase = PHASE_CHECK_ERROR;
-      phaseStartTime = now;
-    }
-  }
-}
+// ========== BLE GLOBALS ==========
+BLEServer*         pServer           = NULL;
+BLECharacteristic* pTxCharacteristic = NULL;
+bool bleDeviceConnected = false;
+bool bleInitialized     = false;
+bool bleModeActive = false;
+bool pendingRestart = false;
+unsigned long bleDisconnectTime = 0;
+unsigned long bleModeStartTime = 0;
+const unsigned long BLE_MIN_RUNTIME = 60000; // 60 seconds minimum
+String bleBuffer = "";
 
 // ========== FORWARD DECLARATIONS ==========
 void loadStudents();
 void saveStudents();
-int getNextFreeSlot();
+int  getNextFreeSlot();
 void handleStorageFull();
 void sendOutput(String msg, int commandId = -1);
 void sendHeartbeat();
@@ -317,18 +228,353 @@ void connectWifi();
 void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length);
 void initializeFingerprint();
 void initializeNFC();
+void initBLE();
 uint8_t getFingerprintEnroll(int slot, int sID);
-int scanFingerprint();
-int findStudent(int fingerprintID);
+int  scanFingerprint();
+int  findStudent(int fingerprintID);
 void handleNFCCardNonBlocking();
 String readNFCNDEFText();
 void queueOfflineLog(int studentID, String method);
+void queueOfflineNFCLog(String encryptedData, String iv, String authTag, String nfcDate,
+                        String dateScanned, String timeScanned);
 void flushOfflineLogs();
 void updateLedStatus();
-int parseEnrollStudentID(String tagText);
+int  parseEnrollStudentID(String tagText);
+bool clearNFCTag();
+bool writeNFCText(String text);
 
+// ========== LED CONTROL ==========
+void setLedColor(LedState state) {
+  if (!fingerprintInitialized) return;
 
-// ========== FINGERPRINT ==========
+  uint8_t color   = FINGERPRINT_LED_RED;
+  uint8_t ledMode = FINGERPRINT_LED_ON;
+
+  switch (state) {
+    case LED_DISCONNECTED_WIFI:
+      finger.LEDcontrol(FINGERPRINT_LED_ON, 0, FINGERPRINT_LED_RED);
+      break;
+    case LED_DISCONNECTED_WS:
+      finger.LEDcontrol(FINGERPRINT_LED_ON, 0, FINGERPRINT_LED_WHITE);
+      break;
+    case LED_SCANNER_CONNECTED:
+      finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 3000, FINGERPRINT_LED_BLUE);
+      break;
+    case LED_SCANNER_OFFLINE:
+      finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 1500, FINGERPRINT_LED_CYAN);
+      break;
+    case LED_ENROLL_CONNECTED:
+      finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 3000, FINGERPRINT_LED_YELLOW);
+      break;
+    case LED_ENROLL_OFFLINE:
+      finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 1500, FINGERPRINT_LED_YELLOW);
+      break;
+    case LED_SUCCESS:
+      finger.LEDcontrol(FINGERPRINT_LED_ON, 0, FINGERPRINT_LED_GREEN);
+      break;
+    default:
+      finger.LEDcontrol(FINGERPRINT_LED_ON, 0, FINGERPRINT_LED_RED);
+      break;
+  }
+}
+
+void setLedSuccess() {
+  if (!fingerprintInitialized) return;
+  successOverrideActive = true;
+  successOverrideUntil  = millis() + LED_SUCCESS_DURATION;
+  currentLedState       = LED_SUCCESS;
+  currentPhase          = PHASE_SUCCESS;
+  setLedColor(LED_SUCCESS);
+}
+
+LedState getDesiredModeState() {
+  if (WifiConnected && websocketConnected) {
+    return (mode == "enroll") ? LED_ENROLL_CONNECTED : LED_SCANNER_CONNECTED;
+  } else if (WifiConnected && !websocketConnected) {
+    return LED_DISCONNECTED_WS;
+  } else {
+    return (mode == "enroll") ? LED_ENROLL_OFFLINE : LED_SCANNER_OFFLINE;
+  }
+}
+
+void updateLedStatus() {
+  if (!fingerprintInitialized) return;
+  unsigned long now = millis();
+
+  if (successOverrideActive) {
+    if (now >= successOverrideUntil) {
+      successOverrideActive = false;
+      currentPhase          = PHASE_CHECK_ERROR;
+      phaseStartTime        = now;
+    }
+    return;
+  }
+
+  if (currentPhase == PHASE_CHECK_ERROR) {
+    if (!WifiConnected) {
+      if (currentLedState != LED_DISCONNECTED_WIFI) {
+        currentLedState = LED_DISCONNECTED_WIFI;
+        setLedColor(LED_DISCONNECTED_WIFI);
+        phaseStartTime = now;
+      }
+      if (now - phaseStartTime >= LED_ERROR_DURATION) {
+        currentPhase   = PHASE_SHOW_MODE;
+        phaseStartTime = now;
+      }
+    } else if (!websocketConnected) {
+      if (currentLedState != LED_DISCONNECTED_WS) {
+        currentLedState = LED_DISCONNECTED_WS;
+        setLedColor(LED_DISCONNECTED_WS);
+        phaseStartTime = now;
+      }
+      if (now - phaseStartTime >= LED_ERROR_DURATION) {
+        currentPhase   = PHASE_SHOW_MODE;
+        phaseStartTime = now;
+      }
+    } else {
+      currentPhase   = PHASE_SHOW_MODE;
+      phaseStartTime = now;
+    }
+  } else if (currentPhase == PHASE_SHOW_MODE) {
+    LedState desired = getDesiredModeState();
+    if (currentLedState != desired) {
+      currentLedState = desired;
+      setLedColor(desired);
+      phaseStartTime = now;
+    }
+    if (now - phaseStartTime >= LED_MODE_DURATION) {
+      currentPhase   = PHASE_CHECK_ERROR;
+      phaseStartTime = now;
+    }
+  }
+}
+
+// ========== BLE UUIDS ==========
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID_TX "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CHARACTERISTIC_UUID_RX "e3223119-9445-4e96-a4a1-85358c4046a2"
+
+// ========== BLE CALLBACKS ==========
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    bleDeviceConnected = true;
+    Serial.println("[BLE] Phone Connected!");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    bleDeviceConnected = false;
+
+    Serial.println("[BLE] Phone Disconnected!");
+
+    bleDisconnectTime = millis();
+  }
+};
+
+void stopBLE() {
+  if (!bleInitialized) return;
+
+  Serial.println("[BLE] Stopping BLE...");
+
+  // Stop advertising first
+  BLEDevice::getAdvertising()->stop();
+
+  delay(200);
+
+  // Fully deinitialize BT stack
+  BLEDevice::deinit(true);
+
+  // IMPORTANT: clear dangling pointers
+  pServer = nullptr;
+  pTxCharacteristic = nullptr;
+
+  bleInitialized = false;
+  bleDeviceConnected = false;
+  bleModeActive = false;
+
+  delay(500);
+
+  Serial.println("[BLE] BLE stopped");
+}
+
+void parseConfigPair(String pair);
+void parseConfiguration(String configString);
+
+class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) override {
+
+    String rxValue = pCharacteristic->getValue();
+    rxValue.trim();
+
+    if (rxValue.length() == 0) return;
+
+    Serial.println("[BLE CHUNK] " + rxValue);
+
+    bleBuffer += rxValue;
+
+    if (bleBuffer.indexOf("CONFIG_END") != -1) {
+
+      Serial.println("[BLE] FULL CONFIG RECEIVED:");
+      Serial.println(bleBuffer);
+
+      parseConfiguration(bleBuffer);
+
+      if (pTxCharacteristic) {
+        pTxCharacteristic->setValue("CONFIG:OK");
+        pTxCharacteristic->notify();
+      }
+
+      bleBuffer = "";
+    }
+  }
+};
+
+// ========== BLE INIT ==========
+void initBLE() {
+  if (bleInitialized) {
+    Serial.println("[BLE] Already initialized");
+    return;
+  }
+
+  Serial.println("[BLE] Preparing for BLE mode...");
+
+  // ===== DISCONNECT NETWORKING =====
+  websocketConnected = false;
+
+  webSocket.disconnect();
+
+  delay(200);
+
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+
+  WifiConnected = false;
+
+  delay(500);
+
+  Serial.println("[BLE] WiFi + WebSocket stopped");
+
+  // ===== START BLE =====
+  Serial.println("[BLE] Starting Bluetooth...");
+  Serial.printf("[BLE] Free heap before BLE: %u\n", ESP.getFreeHeap());
+
+  BLEDevice::init("ESP32-BluePrint_Scanner");
+
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pTxCharacteristic = pService->createCharacteristic(
+      CHARACTERISTIC_UUID_TX,
+      BLECharacteristic::PROPERTY_NOTIFY
+  );
+
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+      CHARACTERISTIC_UUID_RX,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+  );
+
+  pRxCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+
+  pService->start();
+
+  BLEDevice::setMTU(185);
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->start();
+
+  bleInitialized = true;
+  bleModeStartTime = millis();
+  bleModeActive = true;
+
+  Serial.println("[BLE] Advertising started");
+}
+
+// ========== BLE CONFIG PARSING ==========
+void parseConfigPair(String pair) {
+  pair.trim();
+  int eqIdx = pair.indexOf('=');
+  if (eqIdx == -1) return;
+
+  String key   = pair.substring(0, eqIdx);
+  String value = pair.substring(eqIdx + 1);
+  key.trim();
+  value.trim();
+  if (value.startsWith("\"")) value = value.substring(1);
+  if (value.endsWith("\""))   value = value.substring(0, value.length() - 1);
+
+  if (key == "SCANNER_ID") {
+    strncpy(config.scanner_id, value.c_str(), sizeof(config.scanner_id) - 1);
+    config.scanner_id[sizeof(config.scanner_id) - 1] = '\0';
+    Serial.print("[BLE] Scanner ID set to: "); Serial.println(value);
+  } else if (key == "SCANNER_PASSWORD") {
+    strncpy(config.scanner_pass, value.c_str(), sizeof(config.scanner_pass) - 1);
+    config.scanner_pass[sizeof(config.scanner_pass) - 1] = '\0';
+    Serial.println("[BLE] Scanner Password set");
+  } else if (key == "SCANNER_LOC") {
+    strncpy(config.scanner_loc, value.c_str(), sizeof(config.scanner_loc) - 1);
+    config.scanner_loc[sizeof(config.scanner_loc) - 1] = '\0';
+    Serial.print("[BLE] Scanner Location set to: "); Serial.println(value);
+  } else if (key == "SSID") {
+    strncpy(config.ssid, value.c_str(), sizeof(config.ssid) - 1);
+    config.ssid[sizeof(config.ssid) - 1] = '\0';
+    Serial.print("[BLE] WiFi SSID set to: "); Serial.println(value);
+  } else if (key == "WIFI_PASS") {
+    strncpy(config.password, value.c_str(), sizeof(config.password) - 1);
+    config.password[sizeof(config.password) - 1] = '\0';
+    Serial.println("[BLE] WiFi Password set");
+  }
+}
+
+void parseConfiguration(String configString) {
+
+  configString.replace("CONFIG_START", "");
+  configString.replace("CONFIG_END", "");
+  configString.trim();
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, configString);
+
+  if (err) {
+    Serial.println("[BLE] JSON parse failed");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  if (doc.containsKey("scanner_id")) {
+    strncpy(config.scanner_id, doc["scanner_id"], sizeof(config.scanner_id));
+  }
+
+  if (doc.containsKey("scanner_pass")) {
+    strncpy(config.scanner_pass, doc["scanner_pass"], sizeof(config.scanner_pass));
+  }
+
+  if (doc.containsKey("scanner_loc")) {
+    strncpy(config.scanner_loc, doc["scanner_loc"], sizeof(config.scanner_loc));
+  }
+
+  if (doc.containsKey("ssid")) {
+    strncpy(config.ssid, doc["ssid"], sizeof(config.ssid));
+  }
+
+  if (doc.containsKey("wifi_pass")) {
+    strncpy(config.password, doc["wifi_pass"], sizeof(config.password));
+  }
+
+  saveConfig();
+
+  Serial.println("[BLE] Config updated successfully");
+
+  if (pTxCharacteristic) {
+    pTxCharacteristic->setValue("CONFIG:OK:RESTARTING");
+    pTxCharacteristic->notify();
+  }
+
+  pendingRestart = true;
+}
+
+// ========== FINGERPRINT INIT ==========
 void initializeFingerprint() {
   mySerial.begin(57600, SERIAL_8N1, RX_GPIO, TX_GPIO);
   delay(5);
@@ -337,7 +583,7 @@ void initializeFingerprint() {
   if (finger.verifyPassword()) {
     Serial.println("✓ Found fingerprint sensor!");
     fingerprintInitialized = true;
-    currentPhase = PHASE_CHECK_ERROR;
+    currentPhase   = PHASE_CHECK_ERROR;
     phaseStartTime = millis();
   } else {
     Serial.println("✗ Did not find fingerprint sensor :(");
@@ -345,30 +591,41 @@ void initializeFingerprint() {
   }
 }
 
+// ========== NFC INIT ==========
+void initializeNFC() {
+  Wire.begin(21, 22);
+  nfc.begin();
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (!versiondata) {
+    Serial.println("✗ Did not find PN532 NFC board");
+    nfcInitialized = false;
+    return;
+  }
+  nfc.SAMConfig();
+  nfcInitialized = true;
+  Serial.println("✓ NFC scanner initialized.");
+}
+
+// ========== BUTTON HANDLER ==========
 void handleButton() {
   bool currentState = digitalRead(BUTTON_PIN);
 
-  // Button pressed (falling edge)
   if (buttonLastState == HIGH && currentState == LOW) {
     buttonPressStart = millis();
-    buttonPressed = true;
+    buttonPressed    = true;
   }
 
-  // Button released (rising edge)
   if (buttonLastState == LOW && currentState == HIGH && buttonPressed) {
     unsigned long pressDuration = millis() - buttonPressStart;
     buttonPressed = false;
 
-    // ---- SHORT PRESS ----
     if (pressDuration > SHORT_PRESS_TIME && pressDuration < LONG_PRESS_TIME) {
-      // Cancel enrollment if active
+      // ── Short press: cancel enrollment or toggle mode ──
       if (enrollmentActive) {
         enrollmentCancelled = true;
         sendOutput("Enrollment cancelled (button).", -1);
         return;
       }
-      
-      // Toggle mode – LED will be updated automatically by the state machine
       if (mode == "scanner") {
         mode = "enroll";
         sendOutput("Mode set to enroll (button)", -1);
@@ -377,89 +634,25 @@ void handleButton() {
         sendOutput("Mode set to scanner (button)", -1);
       }
     }
-
-    // ---- LONG PRESS ----
-    else if (pressDuration >= LONG_PRESS_TIME) {
+    /*else if (pressDuration >= LONG_PRESS_TIME && pressDuration < BLE_PRESS_TIME) {
+      // ── 1.5–5 sec: manual reconnect + reauth ──
       sendOutput("Manual reconnect + reauth...", -1);
       connectWifi();
       if (signIn()) {
         flushOfflineLogs();
       }
+    }*/
+    else if (pressDuration >= BLE_PRESS_TIME) {
+      // ── 5+ sec: enable BLE for configuration ──
+      Serial.println("[BUTTON] 5-second hold detected — enabling BLE...");
+      initBLE();
     }
   }
 
   buttonLastState = currentState;
 }
 
-// ========== NFC ==========
-void initializeNFC() {
-  Wire.begin(21, 22);
-  nfc.begin();
-  
-  uint32_t versiondata = nfc.getFirmwareVersion();
-  if (!versiondata) {
-    Serial.println("✗ Did not find PN532 NFC board");
-    nfcInitialized = false;
-    return;
-  }
-  
-  Serial.print("✓ Found PN5");
-  
-  nfc.SAMConfig();
-  nfcInitialized = true;
-  Serial.println("✓ NFC scanner initialized.");
-}
-
-String readNFCNDEFText() {
-  // Read pages 4-7 (NDEF message area on NTAG21x)
-  uint8_t buf[96];
-  int idx = 0;
-  for (int page = 4; page <= 27; page++) {
-    uint8_t pageData[4];
-    if (nfc.ntag2xx_ReadPage(page, pageData)) {
-      for (int i = 0; i < 4; i++) buf[idx++] = pageData[i];
-    } else {
-      break;
-    }
-  }
-  // Look for NDEF TLV (type 0x03)
-  for (int i = 0; i < idx - 2; i++) {
-    if (buf[i] == 0x03) {
-      uint8_t msgLen = buf[i + 1];
-      int start = i + 2;
-      if (start + msgLen > idx) break;  // safety check
-      uint8_t* rec = &buf[start];
-
-      uint8_t tnf = rec[0] & 0x07;      // Type Name Format
-      bool sr = rec[0] & 0x10;          // Short Record flag
-      uint8_t typeLen = rec[1];
-
-      // We expect Well-Known Type (tnf=0x01) and type='T' (text)
-      if (tnf == 0x01 && typeLen == 1) {
-        // Position of the type field depends on SR flag
-        uint8_t type = rec[sr ? 3 : 6];
-        if (type == 'T') {
-          // Status byte offset
-          uint8_t status = rec[(sr ? 4 : 7)];
-          uint8_t langLen = status & 0x3F;
-          uint32_t payloadLen = sr ? rec[2] : (rec[2] << 24 | rec[3] << 16 | rec[4] << 8 | rec[5]);
-          uint8_t* textStart = &rec[(sr ? 4 : 7) + 1 + langLen];
-          uint32_t textLen = payloadLen - (1 + langLen);
-
-          String result;
-          for (uint32_t j = 0; j < textLen; j++) {
-            result += (char)textStart[j];
-          }
-          return result;
-        }
-      }
-      break;
-    }
-  }
-  return "";  // no valid text record found
-}
-
-// ========== LITTLEFS ==========
+// ========== STUDENT MAP ==========
 void loadStudents() {
   File file = LittleFS.open(STUDENTS_BIN, FILE_READ);
   if (file) {
@@ -492,20 +685,7 @@ int getNextFreeSlot() {
 
 void handleStorageFull() {
   Serial.println("[STORAGE] No free fingerprint slots!");
-  Serial.println("Would you like to delete ALL stored fingerprints? (y/n)");
-  while (!Serial.available());
-  char response = Serial.read();
-  if (response == 'y' || response == 'Y') {
-    if (finger.emptyDatabase() == FINGERPRINT_OK) {
-      Serial.println("[STORAGE] All fingerprints deleted from sensor.");
-      memset(students, 0, sizeof(students));
-      saveStudents();
-    } else {
-      Serial.println("[STORAGE] Failed to delete sensor database.");
-    }
-  } else {
-    Serial.println("[STORAGE] Deletion cancelled.");
-  }
+  sendOutput("No free fingerprint slots! Use 'slots clear all' to reset.", -1);
 }
 
 int findStudent(int fingerprintID) {
@@ -513,7 +693,7 @@ int findStudent(int fingerprintID) {
   return students[fingerprintID];
 }
 
-// ========== FINGERPRINT SCANNING & ENROLLMENT ==========
+// ========== FINGERPRINT SCAN & ENROLL ==========
 int scanFingerprint() {
   uint8_t p = finger.getImage();
   if (p != FINGERPRINT_OK) return -1;
@@ -524,18 +704,16 @@ int scanFingerprint() {
   return finger.fingerID;
 }
 
-// Flush WS send buffer — call after every sendOutput inside blocking loops
 static inline void wsFlush() {
   for (int i = 0; i < 10; i++) { webSocket.loop(); delay(10); }
 }
 
 uint8_t getFingerprintEnroll(int slot, int sID) {
   int p = -1;
-  enrollmentActive = true;
+  enrollmentActive    = true;
   enrollmentCancelled = false;
   enrollmentStudentID = sID;
 
-  // ── Step 1: first scan ───────────────────────────────────────────────────
   sendOutput("Place finger on sensor for student " + String(sID) + "...", -1);
   sendOutput("Type 'cancel' to abort enrollment.", -1);
   wsFlush();
@@ -543,41 +721,33 @@ uint8_t getFingerprintEnroll(int slot, int sID) {
   while (p != FINGERPRINT_OK) {
     webSocket.loop();
     updateLedStatus();
-    
-    // Check for cancellation
     if (enrollmentCancelled) {
       enrollmentActive = false;
       sendOutput("Enrollment cancelled.", -1);
       return 0xFF;
     }
-
     p = finger.getImage();
-    webSocket.loop();
-    if (p == FINGERPRINT_NOFINGER) { continue; }
-    if (p != FINGERPRINT_OK) { continue; }
+    if (p == FINGERPRINT_NOFINGER) continue;
+    if (p != FINGERPRINT_OK) continue;
   }
 
   p = finger.image2Tz(1);
   if (p != FINGERPRINT_OK) {
     sendOutput("First scan failed — try again.", -1);
-    wsFlush();
-    delay(3000);
+    wsFlush(); delay(3000);
     enrollmentActive = false;
     return p;
   }
 
-  // ── Step 2: lift finger ──────────────────────────────────────────────────
   sendOutput("Good scan. Lift your finger.", -1);
   setLedSuccess();
   wsFlush();
   delay(1000);
-  
   while (finger.getImage() != FINGERPRINT_NOFINGER) {
     updateLedStatus();
     webSocket.loop();
   }
 
-  // ── Step 3: second scan ──────────────────────────────────────────────────
   p = -1;
   sendOutput("Place the SAME finger again to confirm...", -1);
   wsFlush();
@@ -585,41 +755,34 @@ uint8_t getFingerprintEnroll(int slot, int sID) {
   while (p != FINGERPRINT_OK) {
     updateLedStatus();
     webSocket.loop();
-    
     if (enrollmentCancelled) {
       enrollmentActive = false;
       sendOutput("Enrollment cancelled.", -1);
       return 0xFF;
     }
-
     p = finger.getImage();
-    webSocket.loop();
-    if (p == FINGERPRINT_NOFINGER) { continue; }
-    if (p != FINGERPRINT_OK) { continue; }
+    if (p == FINGERPRINT_NOFINGER) continue;
+    if (p != FINGERPRINT_OK) continue;
   }
 
   p = finger.image2Tz(2);
   if (p != FINGERPRINT_OK) {
     sendOutput("Second scan failed. Try again.", -1);
-    wsFlush();
-    delay(3000);
+    wsFlush(); delay(3000);
     enrollmentActive = false;
     return p;
   }
 
-  // ── Step 4: create & store model ────────────────────────────────────────
   p = finger.createModel();
   if (p == FINGERPRINT_ENROLLMISMATCH) {
     sendOutput("Fingerprints did not match — please retry.", -1);
-    wsFlush();
-    delay(3000);
+    wsFlush(); delay(3000);
     enrollmentActive = false;
     return p;
   }
   if (p != FINGERPRINT_OK) {
     sendOutput("Model creation failed (error " + String(p) + ").", -1);
-    wsFlush();
-    delay(3000);
+    wsFlush(); delay(3000);
     enrollmentActive = false;
     return p;
   }
@@ -627,8 +790,7 @@ uint8_t getFingerprintEnroll(int slot, int sID) {
   p = finger.storeModel(slot);
   if (p != FINGERPRINT_OK) {
     sendOutput("Failed to store fingerprint (error " + String(p) + ").", -1);
-    wsFlush();
-    delay(3000);
+    wsFlush(); delay(3000);
     enrollmentActive = false;
     return p;
   }
@@ -642,7 +804,7 @@ uint8_t getFingerprintEnroll(int slot, int sID) {
   delay(500);
   setLedSuccess();
   wsFlush();
-  
+
   enrollmentActive = false;
   return FINGERPRINT_OK;
 }
@@ -657,9 +819,9 @@ bool signIn() {
   if (!http.begin(client, url)) { http.end(); return false; }
   http.addHeader("Content-Type", "application/json");
   StaticJsonDocument<256> doc;
-  doc["SCANNER_ID"] = SCANNER_ID;
-  doc["SCANNER_LOCATION"] = SCANNER_LOCATION;
-  doc["SCANNER_PASSWORD"] = SCANNER_PASSWORD;
+  doc["SCANNER_ID"]       = config.scanner_id;
+  doc["SCANNER_LOCATION"] = config.scanner_loc;
+  doc["SCANNER_PASSWORD"] = config.scanner_pass;
   String body;
   serializeJson(doc, body);
   int code = http.POST(body);
@@ -667,7 +829,7 @@ bool signIn() {
     String response = http.getString();
     StaticJsonDocument<512> resp;
     deserializeJson(resp, response);
-    authToken = resp["token"].as<String>();
+    authToken   = resp["token"].as<String>();
     scannerDbId = resp["user"]["id"].as<String>();
     Serial.println("✓ Scanner authenticated.");
     http.end();
@@ -681,13 +843,11 @@ bool signIn() {
 void getDateTime(String &dateStr, String &timeStr) {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 0)) {
-    Serial.println("[TIME] NTP not synced yet -- using fallback timestamp.");
     dateStr = "0000-00-00";
     timeStr = "00:00:00";
     return;
   }
-  char dateBuffer[11];
-  char timeBuffer[9];
+  char dateBuffer[11], timeBuffer[9];
   strftime(dateBuffer, sizeof(dateBuffer), "%Y-%m-%d", &timeinfo);
   strftime(timeBuffer, sizeof(timeBuffer), "%H:%M:%S", &timeinfo);
   dateStr = String(dateBuffer);
@@ -699,95 +859,67 @@ void sendLog(int studentID, String method) {
     queueOfflineLog(studentID, method);
     return;
   }
-
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.setTimeout(5000);
-
   if (!http.begin(client, String(serverEndpoint) + "/api/logs")) {
-    Serial.println("[LOG] http.begin failed -- queuing offline.");
     queueOfflineLog(studentID, method);
     http.end();
     return;
   }
-
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", "Bearer " + authToken);
-
   String dateStr, timeStr;
   getDateTime(dateStr, timeStr);
-
   StaticJsonDocument<256> doc;
-  doc["scanner_location"] = SCANNER_LOCATION;
-  doc["scanner_id"]       = SCANNER_ID;
+  doc["scanner_location"] = config.scanner_loc;
+  doc["scanner_id"]       = config.scanner_id;
   doc["student_id"]       = studentID;
   doc["date_scanned"]     = dateStr;
   doc["time_scanned"]     = timeStr;
   doc["status"]           = "null";
   doc["method"]           = method;
-
   String body;
   serializeJson(doc, body);
-
   int code = http.POST(body);
-  if (code != 201) {
-    Serial.printf("[LOG] Server returned %d -- queuing offline.\n", code);
-    queueOfflineLog(studentID, method);
-  }
+  if (code != 201) queueOfflineLog(studentID, method);
   http.end();
 }
 
 void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED || authToken == "" || scannerDbId == "") return;
-
-  // Read battery
   int raw = analogRead(batteryPin);
-  float voltageAtPin = (raw / 4095.0) * VREF;
-  float batteryVoltage = voltageAtPin * ((R1 + R2)/R2) * calibrationFactor;
-
+  float voltageAtPin   = (raw / 4095.0) * VREF;
+  float batteryVoltage = voltageAtPin * ((R1 + R2) / R2) * calibrationFactor;
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.setTimeout(10000);
-
+  http.setTimeout(2000);
   if (!http.begin(client, String(serverEndpoint) + "/api/scanners/" + scannerDbId + "/heartbeat")) {
-    http.end();
-    return;
+    http.end(); return;
   }
-
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", "Bearer " + authToken);
-
   StaticJsonDocument<128> doc;
   doc["battery_level"] = batteryVoltage;
-
   String body;
   serializeJson(doc, body);
-
   int code = http.POST(body);
-  if (code != 200) {
+  if (code == 401) {
     authToken = "";
+    Serial.println("[HEARTBEAT] 401 Unauthorized — token cleared.");
   }
-  /*if (code == 401) {
-    Serial.println("[HEARTBEAT] 401 Unauthorized — clearing token, will reauth.");
-    authToken = "";
-  } else if (code != 200) {
-    Serial.printf("[HEARTBEAT] Non-200 response (%d) — keeping token.\n", code);
-  }*/
-
   http.end();
 }
 
 void sendOutput(String msg, int commandId) {
-  if (!webSocket.isConnected()) {
-    return;
-  }
+  if (!webSocket.isConnected()) return;
   StaticJsonDocument<256> doc;
-  doc["type"] = "output";
+  doc["type"]      = "output";
   doc["scannerId"] = scannerDbId;
-  doc["output"] = msg;
-  doc["mode"] = mode;
+  doc["output"]    = msg;
+  doc["mode"]      = mode;
   doc["commandId"] = commandId;
   String body;
   serializeJson(doc, body);
@@ -799,11 +931,9 @@ void handleCommand(String cmd, int commandId) {
   cmd.trim();
   Serial.printf("[CMD] Processing: '%s' (ID: %d)\n", cmd.c_str(), commandId);
 
-  // ===== MODE =====
   if (cmd.startsWith("set mode ")) {
     String newMode = cmd.substring(9);
     newMode.trim();
-
     if (newMode == "scanner" || newMode == "enroll") {
       mode = newMode;
       sendOutput("Mode set to " + newMode, commandId);
@@ -813,7 +943,6 @@ void handleCommand(String cmd, int commandId) {
     return;
   }
 
-  // ===== CANCEL ENROLLMENT =====
   if (cmd == "cancel") {
     if (enrollmentActive) {
       enrollmentCancelled = true;
@@ -824,28 +953,26 @@ void handleCommand(String cmd, int commandId) {
     return;
   }
 
-  // ===== STATUS =====
   if (cmd == "status") {
-    String msg = "Status:\n";
+    String msg  = "Status:\n";
     msg += "Mode: " + mode + "\n";
     msg += "WiFi: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + "\n";
     msg += "IP: " + WiFi.localIP().toString() + "\n";
     msg += "Fingerprint: " + String(fingerprintInitialized ? "OK" : "NOT FOUND") + "\n";
     msg += "NFC: " + String(nfcInitialized ? "OK" : "NOT FOUND") + "\n";
+    msg += "BLE: " + String(bleInitialized ? "Active" : "Off") + "\n";
     msg += "Auth: " + String(authToken != "" ? "OK" : "NOT AUTHENTICATED");
     sendOutput(msg, commandId);
     return;
   }
 
-  // ===== PING =====
   if (cmd == "ping") {
     sendOutput("pong", commandId);
     return;
   }
 
-  // ===== WIFI =====
   if (cmd == "wifi info") {
-    String msg = "WiFi Info:\n";
+    String msg  = "WiFi Info:\n";
     msg += "SSID: " + String(WiFi.SSID()) + "\n";
     msg += "IP: " + WiFi.localIP().toString() + "\n";
     msg += "RSSI: " + String(WiFi.RSSI()) + " dBm";
@@ -853,56 +980,51 @@ void handleCommand(String cmd, int commandId) {
     return;
   }
 
-  // ===== RESTART =====
   if (cmd == "restart") {
     sendOutput("Restarting device...", commandId);
     delay(500);
     ESP.restart();
   }
 
-  // ===== REAUTH =====
   if (cmd == "reauth") {
     if (signIn()) {
       sendOutput("Re-authentication successful.", commandId);
-
       if (webSocket.isConnected()) {
         StaticJsonDocument<256> doc;
-        doc["type"] = "auth";
+        doc["type"]      = "auth";
         doc["scannerId"] = scannerDbId;
-        doc["token"] = authToken;
+        doc["token"]     = authToken;
         String msg;
         serializeJson(doc, msg);
         webSocket.sendTXT(msg);
       }
-
     } else {
       sendOutput("Re-authentication FAILED.", commandId);
     }
     return;
   }
 
-  // ===== SLOT LIST =====
-  if (cmd == "slots list") {
-    String msg = "Slots:\n";
-    int count = 0;
+  if (cmd == "ble on") {
+    initBLE();
+    return;
+  }
 
+  if (cmd == "slots list") {
+    String msg  = "Slots:\n";
+    int count = 0;
     for (int i = 1; i <= MAX_FINGERPRINT_SLOTS; i++) {
       if (students[i] != 0) {
         msg += "Slot " + String(i) + " → " + String(students[i]) + "\n";
         count++;
       }
     }
-
     if (count == 0) msg = "No fingerprints stored.";
-
     sendOutput(msg, commandId);
     return;
   }
 
-  // ===== SLOT CLEAR ALL =====
   if (cmd == "slots clear all") {
     memset(students, 0, sizeof(students));
-
     if (finger.emptyDatabase() == FINGERPRINT_OK) {
       saveStudents();
       sendOutput("All slots cleared.", commandId);
@@ -912,10 +1034,8 @@ void handleCommand(String cmd, int commandId) {
     return;
   }
 
-  // ===== SLOT CLEAR ONE =====
   if (cmd.startsWith("slots clear ")) {
     int slot = cmd.substring(12).toInt();
-
     if (slot >= 1 && slot <= MAX_FINGERPRINT_SLOTS) {
       if (students[slot] != 0) {
         int oldID = students[slot];
@@ -931,10 +1051,8 @@ void handleCommand(String cmd, int commandId) {
     return;
   }
 
-  // ===== SLOT GET =====
   if (cmd.startsWith("slots get ")) {
     int slot = cmd.substring(10).toInt();
-
     if (slot >= 1 && slot <= MAX_FINGERPRINT_SLOTS) {
       if (students[slot] != 0) {
         sendOutput("Slot " + String(slot) + " → Student " + String(students[slot]), commandId);
@@ -947,11 +1065,9 @@ void handleCommand(String cmd, int commandId) {
     return;
   }
 
-  // ===== DELETE STUDENT =====
   if (cmd.startsWith("student delete ")) {
     int studentID = cmd.substring(15).toInt();
     bool found = false;
-
     for (int i = 1; i <= MAX_FINGERPRINT_SLOTS; i++) {
       if (students[i] == studentID) {
         students[i] = 0;
@@ -961,64 +1077,51 @@ void handleCommand(String cmd, int commandId) {
         break;
       }
     }
-
     if (!found) sendOutput("Student not found.", commandId);
     return;
   }
 
-  // ===== TEST =====
   if (cmd == "test scan") {
     sendOutput("Testing fingerprint...", commandId);
-
     int fingerID = scanFingerprint();
     if (fingerID >= 0) {
       sendOutput("Fingerprint detected! ID: " + String(fingerID), commandId);
     } else {
       sendOutput("No fingerprint detected.", commandId);
     }
-
-    sendOutput("Tap NFC card...", commandId);
     return;
   }
 
-  // ===== NUMERIC =====
+  // ── Numeric: manual log or enroll ──
   bool isNumeric = true;
   for (unsigned int i = 0; i < cmd.length(); i++) {
     if (!isdigit(cmd[i])) { isNumeric = false; break; }
   }
 
-  if (isNumeric) {
+  if (isNumeric && cmd.length() > 0) {
     int studentID = cmd.toInt();
-
     if (mode == "enroll") {
       int slot = getNextFreeSlot();
-
       if (slot == -1) {
         handleStorageFull();
         sendOutput("No free slots.", commandId);
         return;
       }
-
       sendOutput("Starting enrollment for student " + String(studentID) + "...", commandId);
       wsFlush();
-
       uint8_t result = getFingerprintEnroll(slot, studentID);
-
       if (result == FINGERPRINT_OK) {
         sendOutput("Enrollment successful (slot " + String(slot) + ")", commandId);
       } else {
         sendOutput("Enrollment failed.", commandId);
       }
-
     } else {
       sendLog(studentID, "manual");
       sendOutput("Manual log for student " + String(studentID), commandId);
     }
-
     return;
   }
 
-  // ===== UNKNOWN =====
   sendOutput("Unknown command: " + cmd, commandId);
 }
 
@@ -1027,11 +1130,12 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED: {
       Serial.println("WebSocket connected.");
+      webSocket.enableHeartbeat(25000, 5000, 3);
       websocketConnected = true;
       StaticJsonDocument<256> doc;
-      doc["type"] = "auth";
+      doc["type"]      = "auth";
       doc["scannerId"] = scannerDbId;
-      doc["token"] = authToken;
+      doc["token"]     = authToken;
       String msg;
       serializeJson(doc, msg);
       webSocket.sendTXT(msg);
@@ -1040,44 +1144,27 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_DISCONNECTED:
       Serial.println("WebSocket disconnected.");
       websocketConnected = false;
-      webSocket.disconnect();
-      delay(100);
-      
-      // Only reconnect if WiFi is active
-      if (WifiConnected) {
-        Serial.println("[WS] WiFi connected, attempting WebSocket reconnect...");
-        webSocket.beginSSL(wsHost, wsPort, wsPath);
-        webSocket.onEvent(onWebSocketEvent);
-        webSocket.setReconnectInterval(5000);
-      } else {
-        Serial.println("[WS] WiFi not ready yet, will reconnect when WiFi available.");
-      }
+      // setReconnectInterval handles automatic reconnection — no manual beginSSL needed here
       break;
     case WStype_TEXT: {
       String data = (char*)payload;
       Serial.printf("[WS] Raw payload: %s\n", data.c_str());
-      
       StaticJsonDocument<256> doc;
       DeserializationError err = deserializeJson(doc, data);
-      
       if (err) {
         Serial.printf("[WS] JSON parse error: %s\n", err.c_str());
         break;
       }
-      
-      String command = doc["command"] | "";
-      int commandId = doc["commandId"] | 0;
-      
-      Serial.printf("[WS] Parsed command: '%s' (ID: %d)\n", command.c_str(), commandId);
-      
+      String command  = doc["command"]   | "";
+      int    commandId = doc["commandId"] | 0;
       if (command != "") {
-        Serial.println("[WS] Calling handleCommand...");
         handleCommand(command, commandId);
-      } else {
-        Serial.println("[WS] Command was empty!");
       }
       break;
     }
+    case WStype_PONG:
+      Serial.println("[WS] Pong received");
+      break;
     case WStype_ERROR:
       Serial.println("WebSocket error.");
       break;
@@ -1086,46 +1173,39 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   }
 }
 
-// ========== WIFI ==========
 void connectWifi() {
-  Serial.printf("[WIFI] Starting connection attempt to %s\n", ssid);
+  Serial.printf("[WIFI] Connecting to %s\n", config.ssid);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  WiFi.begin(config.ssid, config.password);
   WifiConnected = false;
 }
 
-// ========== Offline Logging ==========
-
+// ========== OFFLINE LOGGING ==========
 void queueOfflineLog(int studentID, String method) {
   String dateStr, timeStr;
   getDateTime(dateStr, timeStr);
 
   OfflineLog entry;
+  memset(&entry, 0, sizeof(entry));
   entry.studentID = studentID;
   strncpy(entry.method, method.c_str(), sizeof(entry.method) - 1);
-  entry.method[sizeof(entry.method) - 1] = '\0';
-  strncpy(entry.date, dateStr.c_str(), sizeof(entry.date) - 1);
-  entry.date[sizeof(entry.date) - 1] = '\0';
-  strncpy(entry.time, timeStr.c_str(), sizeof(entry.time) - 1);
-  entry.time[sizeof(entry.time) - 1] = '\0';
+  strncpy(entry.date,   dateStr.c_str(), sizeof(entry.date) - 1);
+  strncpy(entry.time,   timeStr.c_str(), sizeof(entry.time) - 1);
 
   int count = 0;
   File rf = LittleFS.open(OFFLINE_LOGS_FILE, FILE_READ);
-  if (rf) {
-    count = rf.size() / sizeof(OfflineLog);
-    rf.close();
-  }
+  if (rf) { count = rf.size() / sizeof(OfflineLog); rf.close(); }
 
   if (count >= MAX_OFFLINE_LOGS) {
-    Serial.println("[OFFLINE] Queue full -- dropping oldest log.");
+    Serial.println("[OFFLINE] Queue full — dropping oldest log.");
     OfflineLog* buf = (OfflineLog*)malloc(sizeof(OfflineLog) * MAX_OFFLINE_LOGS);
-    if (!buf) { Serial.println("[OFFLINE] malloc failed."); return; }
+    if (!buf) return;
     File r2 = LittleFS.open(OFFLINE_LOGS_FILE, FILE_READ);
     if (r2) { r2.read((uint8_t*)buf, sizeof(OfflineLog) * MAX_OFFLINE_LOGS); r2.close(); }
     File w2 = LittleFS.open(OFFLINE_LOGS_FILE, FILE_WRITE);
     if (w2) {
       w2.write((uint8_t*)&buf[1], sizeof(OfflineLog) * (MAX_OFFLINE_LOGS - 1));
-      w2.write((uint8_t*)&entry, sizeof(OfflineLog));
+      w2.write((uint8_t*)&entry,  sizeof(OfflineLog));
       w2.close();
     }
     free(buf);
@@ -1136,8 +1216,7 @@ void queueOfflineLog(int studentID, String method) {
   if (!f) { Serial.println("[OFFLINE] ERROR: Could not open offline log file."); return; }
   f.write((uint8_t*)&entry, sizeof(OfflineLog));
   f.close();
-  Serial.printf("[OFFLINE] Queued log: student=%d method=%s date=%s time=%s\n",
-                studentID, method.c_str(), dateStr.c_str(), timeStr.c_str());
+  Serial.printf("[OFFLINE] Queued log: student=%d method=%s\n", studentID, method.c_str());
 }
 
 void queueOfflineNFCLog(String encryptedData, String iv, String authTag, String nfcDate,
@@ -1145,15 +1224,14 @@ void queueOfflineNFCLog(String encryptedData, String iv, String authTag, String 
   OfflineLog entry;
   memset(&entry, 0, sizeof(entry));
   entry.studentID = -1;
-  strncpy(entry.method,        "nfc",               sizeof(entry.method) - 1);
-  strncpy(entry.date,          dateScanned.c_str(),  sizeof(entry.date) - 1);
-  strncpy(entry.time,          timeScanned.c_str(),  sizeof(entry.time) - 1);
+  strncpy(entry.method,        "nfc",                sizeof(entry.method) - 1);
+  strncpy(entry.date,          dateScanned.c_str(),   sizeof(entry.date) - 1);
+  strncpy(entry.time,          timeScanned.c_str(),   sizeof(entry.time) - 1);
   strncpy(entry.encryptedData, encryptedData.c_str(), sizeof(entry.encryptedData) - 1);
-  strncpy(entry.iv,            iv.c_str(),            sizeof(entry.iv) - 1);
-  strncpy(entry.authTag,       authTag.c_str(),        sizeof(entry.authTag) - 1);
-  strncpy(entry.nfcDate,       nfcDate.c_str(),        sizeof(entry.nfcDate) - 1);
+  strncpy(entry.iv,            iv.c_str(),             sizeof(entry.iv) - 1);
+  strncpy(entry.authTag,       authTag.c_str(),         sizeof(entry.authTag) - 1);
+  strncpy(entry.nfcDate,       nfcDate.c_str(),         sizeof(entry.nfcDate) - 1);
 
-  // same append logic as queueOfflineLog — copy that block here
   int count = 0;
   File rf = LittleFS.open(OFFLINE_LOGS_FILE, FILE_READ);
   if (rf) { count = rf.size() / sizeof(OfflineLog); rf.close(); }
@@ -1166,7 +1244,7 @@ void queueOfflineNFCLog(String encryptedData, String iv, String authTag, String 
     File w2 = LittleFS.open(OFFLINE_LOGS_FILE, FILE_WRITE);
     if (w2) {
       w2.write((uint8_t*)&buf[1], sizeof(OfflineLog) * (MAX_OFFLINE_LOGS - 1));
-      w2.write((uint8_t*)&entry, sizeof(OfflineLog));
+      w2.write((uint8_t*)&entry,  sizeof(OfflineLog));
       w2.close();
     }
     free(buf);
@@ -1182,18 +1260,15 @@ void queueOfflineNFCLog(String encryptedData, String iv, String authTag, String 
 
 void flushOfflineLogs() {
   if (!LittleFS.exists(OFFLINE_LOGS_FILE)) return;
-
   File f = LittleFS.open(OFFLINE_LOGS_FILE, FILE_READ);
   if (!f) return;
-
   int count = f.size() / sizeof(OfflineLog);
   if (count == 0) { f.close(); return; }
 
-  Serial.printf("[OFFLINE] Flushing %d queued log(s) to server...\n", count);
+  Serial.printf("[OFFLINE] Flushing %d queued log(s)...\n", count);
   sendOutput("Flushing " + String(count) + " offline log(s)...", -1);
 
   int sent = 0, failed = 0;
-
   for (int i = 0; i < count; i++) {
     OfflineLog entry;
     f.read((uint8_t*)&entry, sizeof(OfflineLog));
@@ -1205,11 +1280,10 @@ void flushOfflineLogs() {
 
     bool isNFC = (strcmp(entry.method, "nfc") == 0);
     String endpoint = isNFC
-    ? String(serverEndpoint) + "/api/scanner/log"
-    : String(serverEndpoint) + "/api/logs";
+      ? String(serverEndpoint) + "/api/scanner/log"
+      : String(serverEndpoint) + "/api/logs";
 
     if (!http.begin(client, endpoint)) { failed++; http.end(); continue; }
-
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", "Bearer " + authToken);
 
@@ -1220,15 +1294,15 @@ void flushOfflineLogs() {
       doc["iv"]               = entry.iv;
       doc["authTag"]          = entry.authTag;
       doc["date"]             = entry.nfcDate;
-      doc["scanner_location"] = SCANNER_LOCATION;
-      doc["scanner_id"]       = SCANNER_ID;
+      doc["scanner_location"] = config.scanner_loc;
+      doc["scanner_id"]       = config.scanner_id;
       doc["date_scanned"]     = entry.date;
       doc["time_scanned"]     = entry.time;
       serializeJson(doc, body);
     } else {
       StaticJsonDocument<256> doc;
-      doc["scanner_location"] = SCANNER_LOCATION;
-      doc["scanner_id"]       = SCANNER_ID;
+      doc["scanner_location"] = config.scanner_loc;
+      doc["scanner_id"]       = config.scanner_id;
       doc["student_id"]       = entry.studentID;
       doc["date_scanned"]     = entry.date;
       doc["time_scanned"]     = entry.time;
@@ -1246,7 +1320,6 @@ void flushOfflineLogs() {
     http.end();
     webSocket.loop();
   }
-
   f.close();
 
   if (failed == 0) {
@@ -1254,22 +1327,217 @@ void flushOfflineLogs() {
     Serial.println("[OFFLINE] All queued logs sent. File cleared.");
     sendOutput("All offline logs flushed successfully.", -1);
   } else {
-    Serial.printf("[OFFLINE] %d sent, %d failed -- will retry on next reconnect.\n", sent, failed);
-    sendOutput(String(sent) + " sent, " + String(failed) + " failed -- will retry.", -1);
+    Serial.printf("[OFFLINE] %d sent, %d failed — will retry.\n", sent, failed);
+    sendOutput(String(sent) + " sent, " + String(failed) + " failed — will retry.", -1);
   }
+}
+
+// ========== NFC HELPERS ==========
+String readNFCNDEFText() {
+  uint8_t buf[96];
+  int idx = 0;
+  for (int page = 4; page <= 27; page++) {
+    uint8_t pageData[4];
+    if (nfc.ntag2xx_ReadPage(page, pageData)) {
+      for (int i = 0; i < 4; i++) buf[idx++] = pageData[i];
+    } else break;
+  }
+  for (int i = 0; i < idx - 2; i++) {
+    if (buf[i] == 0x03) {
+      uint8_t msgLen = buf[i + 1];
+      int start = i + 2;
+      if (start + msgLen > idx) break;
+      uint8_t* rec     = &buf[start];
+      uint8_t  tnf     = rec[0] & 0x07;
+      bool     sr      = rec[0] & 0x10;
+      uint8_t  typeLen = rec[1];
+      if (tnf == 0x01 && typeLen == 1) {
+        uint8_t type = rec[sr ? 3 : 6];
+        if (type == 'T') {
+          uint8_t  status     = rec[(sr ? 4 : 7)];
+          uint8_t  langLen    = status & 0x3F;
+          uint32_t payloadLen = sr ? rec[2] : (rec[2] << 24 | rec[3] << 16 | rec[4] << 8 | rec[5]);
+          uint8_t* textStart  = &rec[(sr ? 4 : 7) + 1 + langLen];
+          uint32_t textLen    = payloadLen - (1 + langLen);
+          String result;
+          for (uint32_t j = 0; j < textLen; j++) result += (char)textStart[j];
+          return result;
+        }
+      }
+      break;
+    }
+  }
+  return "";
+}
+
+bool clearNFCTag() {
+  uint8_t blank[4] = {0x00, 0x00, 0x00, 0x00};
+  uint8_t term[4]  = {0xFE, 0x00, 0x00, 0x00};
+  if (!nfc.ntag2xx_WritePage(4, term)) return false;
+  for (int page = 5; page <= 7; page++) {
+    if (!nfc.ntag2xx_WritePage(page, blank)) return false;
+  }
+  Serial.println("[NFC] Tag cleared.");
+  return true;
+}
+
+bool writeNFCText(String text) {
+  uint8_t textLen    = text.length();
+  uint8_t payloadLen = 3 + textLen;
+  uint8_t msgLen     = 3 + payloadLen;
+  uint8_t buf[16]    = {0};
+  int i = 0;
+  buf[i++] = 0x03;
+  buf[i++] = msgLen;
+  buf[i++] = 0xD1;
+  buf[i++] = 0x01;
+  buf[i++] = payloadLen;
+  buf[i++] = 'T';
+  buf[i++] = 0x02;
+  buf[i++] = 'e';
+  buf[i++] = 'n';
+  for (int j = 0; j < textLen && i < 15; j++) buf[i++] = text[j];
+  buf[i] = 0xFE;
+  for (int page = 4; page <= 7; page++) {
+    uint8_t pageData[4];
+    memcpy(pageData, &buf[(page - 4) * 4], 4);
+    if (!nfc.ntag2xx_WritePage(page, pageData)) {
+      Serial.println("[NFC] Write failed on page " + String(page));
+      return false;
+    }
+  }
+  return true;
+}
+
+int parseEnrollStudentID(String tagText) {
+  tagText.trim();
+  bool numeric = true;
+  for (unsigned int i = 0; i < tagText.length(); i++) {
+    if (!isdigit(tagText[i])) { numeric = false; break; }
+  }
+  if (numeric && tagText.length() > 0) return tagText.toInt();
+  int colon = tagText.indexOf(':');
+  if (colon >= 0) {
+    String value = tagText.substring(colon + 1);
+    value.trim();
+    bool valueNumeric = true;
+    for (unsigned int i = 0; i < value.length(); i++) {
+      if (!isdigit(value[i])) { valueNumeric = false; break; }
+    }
+    if (valueNumeric && value.length() > 0) return value.toInt();
+  }
+  return -1;
+}
+
+void handleNFCCardNonBlocking() {
+  unsigned long now = millis();
+  if (now - lastNFCCheck < NFC_CHECK_INTERVAL) return;
+  lastNFCCheck = now;
+
+  uint8_t uid[7];
+  uint8_t uidLen = 0;
+  if (!nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50)) return;
+
+  String tagText = readNFCNDEFText();
+  if (tagText.length() == 0) return;
+  tagText.trim();
+
+  if (mode == "enroll") {
+    if (enrollmentActive) return;
+    int studentID = parseEnrollStudentID(tagText);
+    if (studentID <= 0) return;
+    int slot = getNextFreeSlot();
+    if (slot == -1) {
+      handleStorageFull();
+      return;
+    }
+    sendOutput("NFC enroll tag read. Starting enrollment for student " + String(studentID) + "...", -1);
+    writeNFCText(" ");
+    uint8_t result = getFingerprintEnroll(slot, studentID);
+    if (result == FINGERPRINT_OK) {
+      sendOutput("Enrollment successful from NFC tag. Student " + String(studentID) + " saved to slot " + String(slot) + ".", -1);
+    } else {
+      sendOutput("Enrollment failed for NFC student " + String(studentID) + ".", -1);
+    }
+    return;
+  }
+
+  // Scanner mode: expect encrypted payload
+  String parts[4];
+  int partIndex = 0, start = 0;
+  for (int i = 0; i <= (int)tagText.length() && partIndex < 4; i++) {
+    if (i == (int)tagText.length() || tagText[i] == '|') {
+      parts[partIndex++] = tagText.substring(start, i);
+      start = i + 1;
+    }
+  }
+  if (partIndex < 4 || parts[0].length() == 0) return;
+
+  String encryptedData = parts[0];
+  String iv            = parts[1];
+  String authTag       = parts[2];
+  String date          = parts[3];
+
+  Serial.printf("[NFC] Got encrypted payload for date %s\n", date.c_str());
+  writeNFCText(" ");
+
+  String dateStr, timeStr;
+  getDateTime(dateStr, timeStr);
+
+  if (WiFi.status() != WL_CONNECTED || authToken == "") {
+    queueOfflineNFCLog(encryptedData, iv, authTag, date, dateStr, timeStr);
+    setLedSuccess();
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (!http.begin(client, String(serverEndpoint) + "/api/scanner/log")) {
+    http.end(); return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + authToken);
+
+  StaticJsonDocument<512> doc;
+  doc["encryptedData"]    = encryptedData;
+  doc["iv"]               = iv;
+  doc["authTag"]          = authTag;
+  doc["date"]             = date;
+  doc["scanner_location"] = config.scanner_loc;
+  doc["scanner_id"]       = config.scanner_id;
+  doc["date_scanned"]     = dateStr;
+  doc["time_scanned"]     = timeStr;
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.POST(body);
+  if (code == 201) {
+    Serial.println("[NFC] Log created successfully");
+    setLedSuccess();
+    sendOutput("NFC scan logged.", -1);
+  } else {
+    Serial.printf("[NFC] Server returned %d\n", code);
+    queueOfflineNFCLog(encryptedData, iv, authTag, date, dateStr, timeStr);
+  }
+  http.end();
 }
 
 // ========== SETUP ==========
 void setup() {
   Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+  loadConfig();
+
+  WiFi.mode(WIFI_STA);
   delay(1000);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   Serial.println("\n========== BLUEPRINT SCANNER STARTUP ==========");
-  
-  Serial.println("\n[INIT] Initializing fingerprint sensor...");
+  Serial.println("[INIT] Initializing fingerprint sensor...");
   initializeFingerprint();
-  
+
   Serial.println("[INIT] Initializing NFC scanner...");
   initializeNFC();
 
@@ -1284,23 +1552,55 @@ void setup() {
 
   Serial.println("[INIT] Syncing time with NTP (non-blocking)...");
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi connection failed — will retry in loop.");
+  }
+
+  Serial.println("\n========== SCANNER READY ==========");
+  Serial.println("Hold button 5 seconds to enable Bluetooth configuration.");
+  Serial.println("WiFi SSID: "   + String(config.ssid));
+  Serial.println("Scanner ID: "  + String(config.scanner_id));
+  Serial.println("=====================================\n");
 }
 
-// ========== LOOP ========== 
+// ========== LOOP ==========
 void loop() {
-  // ========== WEBSOCKET & NETWORK MANAGEMENT ==========
   webSocket.loop();
 
-  // ========== WiFi Status Management ==========
-  static unsigned long lastWifiRetry = 0;
-  static bool wifiJustConnected = false;
+  if (pendingRestart) {
+    pendingRestart = false;
+    Serial.println("[SYSTEM] Restarting after BLE config update...");
+    if (bleModeActive) {
+      stopBLE();
+      delay(200);
+    }
+    delay(100);
+    ESP.restart();
+  }
+
+  // ── WiFi state management ──
+  static unsigned long lastWifiRetry  = 0;
+  static bool          wifiJustConnected = false;
 
   if (WiFi.status() == WL_CONNECTED && !WifiConnected) {
-    WifiConnected = true;
-    wifiJustConnected = true;
+    WifiConnected      = true;
+    wifiJustConnected  = true;
     Serial.println("[WIFI] Connected. IP: " + WiFi.localIP().toString());
   } else if (WiFi.status() != WL_CONNECTED && WifiConnected) {
     WifiConnected = false;
+    Serial.println("[WIFI] Lost connection.");
   } else if (WiFi.status() != WL_CONNECTED && !WifiConnected) {
     if (millis() - lastWifiRetry > 300000) {
       lastWifiRetry = millis();
@@ -1311,14 +1611,42 @@ void loop() {
 
   if (wifiJustConnected) {
     wifiJustConnected = false;
-    if (signIn()) {
-      flushOfflineLogs();
-    }
+    if (signIn()) flushOfflineLogs();
     webSocket.beginSSL(wsHost, wsPort, wsPath);
     webSocket.onEvent(onWebSocketEvent);
     webSocket.setReconnectInterval(5000);
   }
 
+  // ===== BLE MODE HANDLING =====
+  if (bleModeActive) {
+
+    // Stay in BLE mode while connected
+    if (bleDeviceConnected) {
+      delay(10);
+      return;
+    }
+
+    // If disconnected for 5 seconds, shut BLE down
+    if (!bleDeviceConnected &&
+    millis() - bleModeStartTime > BLE_MIN_RUNTIME &&
+    millis() - bleDisconnectTime > 10000) {
+
+      Serial.println("[BLE] Returning to WiFi mode...");
+
+      stopBLE();
+
+      delay(500);
+
+      WiFi.mode(WIFI_STA);
+
+      connectWifi();
+    }
+
+    delay(10);
+    return;
+  }
+
+  // ── Auto re-auth if token lost ──
   static unsigned long lastReauthAttempt = 0;
   if (WifiConnected && authToken == "" && (millis() - lastReauthAttempt > 15000)) {
     lastReauthAttempt = millis();
@@ -1327,9 +1655,9 @@ void loop() {
       flushOfflineLogs();
       if (webSocket.isConnected()) {
         StaticJsonDocument<256> doc;
-        doc["type"] = "auth";
+        doc["type"]      = "auth";
         doc["scannerId"] = scannerDbId;
-        doc["token"] = authToken;
+        doc["token"]     = authToken;
         String msg;
         serializeJson(doc, msg);
         webSocket.sendTXT(msg);
@@ -1337,24 +1665,23 @@ void loop() {
     }
   }
 
-  // ========== LED STATUS UPDATE (NON-BLOCKING) ==========
+  // ── LED ──
   updateLedStatus();
 
-  // ========== NFC SCANNING ==========
+  // ── NFC (windowed: 500ms active, 2000ms rest) ──
   if (mode == "scanner" || mode == "enroll") {
-    static unsigned long nfcWindowStart = 0;
-    static bool nfcActive = true;
-    static bool nfcNeedsReinit = false;
+    static unsigned long nfcWindowStart  = 0;
+    static bool          nfcActive       = true;
+    static bool          nfcNeedsReinit  = false;
 
     if (nfcActive) {
       handleNFCCardNonBlocking();
       if (millis() - nfcWindowStart >= 500) {
-        nfcActive = false;
-        nfcNeedsReinit = true;      // flag the reset, don't do it yet
+        nfcActive      = false;
+        nfcNeedsReinit = true;
         nfcWindowStart = millis();
       }
     } else {
-      // Do the expensive I2C reset in small steps during the inactive window
       if (nfcNeedsReinit && millis() - nfcWindowStart >= 100) {
         Wire.end();
         Wire.begin(21, 22);
@@ -1363,25 +1690,22 @@ void loop() {
         nfcNeedsReinit = false;
       }
       if (millis() - nfcWindowStart >= 2000) {
-        nfcActive = true;
+        nfcActive      = true;
         nfcWindowStart = millis();
       }
     }
   }
 
-  // ========== FINGERPRINT SCANNING ==========
+  // ── Fingerprint scan ──
   if (fingerprintInitialized && (mode == "scanner" || mode == "enroll")) {
     int fingerID = scanFingerprint();
     if (fingerID >= 0) {
       int studentID = findStudent(fingerID);
       if (studentID > 0) {
-
         static unsigned long lastScanTime = 0;
         if (millis() - lastScanTime < 3000) return;
         lastScanTime = millis();
-
         setLedSuccess();
-
         if (mode == "scanner") {
           pendingLog.studentID = studentID;
           strncpy(pendingLog.method, "fingerprint", sizeof(pendingLog.method) - 1);
@@ -1392,16 +1716,16 @@ void loop() {
     }
   }
 
-  // ========== PROCESS PENDING LOG ==========
+  // ── Process pending log ──
   if (pendingLog.pending) {
     pendingLog.pending = false;
     sendLog(pendingLog.studentID, String(pendingLog.method));
   }
 
-  // ========== BUTTON HANDLING ==========
+  // ── Button ──
   handleButton();
 
-  // ========== HEARTBEAT ==========
+  // ── Heartbeat ──
   static unsigned long lastHeartbeat = 0;
   if (millis() - lastHeartbeat > 5000) {
     sendHeartbeat();
@@ -1409,200 +1733,4 @@ void loop() {
   }
 
   delay(10);
-}
-
-bool clearNFCTag() {
-  // Overwrite pages 4-7 with zeroes, then place a TLV terminator
-  uint8_t blank[4] = {0x00, 0x00, 0x00, 0x00};
-  uint8_t term[4]  = {0xFE, 0x00, 0x00, 0x00}; // TLV terminator in page 4
-
-  // Write terminator to page 4, blank to pages 5-7
-  if (!nfc.ntag2xx_WritePage(4, term)) return false;
-  for (int page = 5; page <= 7; page++) {
-    if (!nfc.ntag2xx_WritePage(page, blank)) return false;
-  }
-  Serial.println("[NFC] Tag cleared.");
-  return true;
-}
-
-bool writeNFCText(String text) {
-  // Build NDEF text record
-  uint8_t textLen = text.length();
-  uint8_t payloadLen = 3 + textLen; // status byte + "en" lang + text
-  uint8_t msgLen = 3 + payloadLen;  // record header + payload
-
-  // Full NDEF message buffer (pages 4-7 = 16 bytes)
-  uint8_t buf[16] = {0};
-  int i = 0;
-  buf[i++] = 0x03;        // NDEF TLV type
-  buf[i++] = msgLen;      // message length
-  buf[i++] = 0xD1;        // MB ME SR=1, TNF=0x01 (Well Known)
-  buf[i++] = 0x01;        // type length = 1
-  buf[i++] = payloadLen;  // payload length
-  buf[i++] = 'T';         // type = Text
-  buf[i++] = 0x02;        // status: UTF-8, lang length = 2
-  buf[i++] = 'e';         // lang: "en"
-  buf[i++] = 'n';
-  for (int j = 0; j < textLen && i < 15; j++) {
-    buf[i++] = text[j];
-  }
-  buf[i] = 0xFE;          // TLV terminator
-
-  // Write 4 bytes per page starting at page 4
-  for (int page = 4; page <= 7; page++) {
-    uint8_t pageData[4];
-    memcpy(pageData, &buf[(page - 4) * 4], 4);
-    if (!nfc.ntag2xx_WritePage(page, pageData)) {
-      Serial.println("[NFC] Write failed on page " + String(page));
-      return false;
-    }
-  }
-  Serial.println("[NFC] Wrote \"" + text + "\" to tag.");
-  return true;
-}
-
-int parseEnrollStudentID(String tagText) {
-  tagText.trim();
-  bool numeric = true;
-  for (unsigned int i = 0; i < tagText.length(); i++) {
-    if (!isdigit(tagText[i])) {
-      numeric = false;
-      break;
-    }
-  }
-  if (numeric && tagText.length() > 0) return tagText.toInt();
-  int colon = tagText.indexOf(':');
-  if (colon >= 0) {
-    String value = tagText.substring(colon + 1);
-    value.trim();
-    bool valueNumeric = true;
-    for (unsigned int i = 0; i < value.length(); i++) {
-      if (!isdigit(value[i])) {
-        valueNumeric = false;
-        break;
-      }
-    }
-    if (valueNumeric && value.length() > 0) return value.toInt();
-  }
-  return -1;
-}
-
-void handleNFCCardNonBlocking() {
-  unsigned long now = millis();
-  if (now - lastNFCCheck < NFC_CHECK_INTERVAL) return;
-  lastNFCCheck = now;
-
-  uint8_t uid[7];
-  uint8_t uidLen = 0;
-
-  if (!nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50)) return;
-
-  String tagText = readNFCNDEFText();
-  if (tagText.length() == 0) {
-    return;
-  }
-  tagText.trim();
-
-  if (mode == "enroll") {
-    if (enrollmentActive) return;
-
-    int studentID = parseEnrollStudentID(tagText);
-    if (studentID <= 0) {
-      return;
-    }
-
-    int slot = getNextFreeSlot();
-    if (slot == -1) {
-      handleStorageFull();
-      sendOutput("No free fingerprint slots.", -1);
-      return;
-    }
-
-    sendOutput("NFC enroll tag read. Starting enrollment for student " + String(studentID) + "...", -1);
-
-    // Clear/blank the tag so holding it near the reader does not retrigger another enrollment.
-    writeNFCText(" ");
-
-    uint8_t result = getFingerprintEnroll(slot, studentID);
-
-    if (result == FINGERPRINT_OK) {
-      sendOutput("Enrollment successful from NFC tag. Student " + String(studentID) + " saved to slot " + String(slot) + ".", -1);
-    } else {
-      sendOutput("Enrollment failed for NFC student " + String(studentID) + ".", -1);
-    }
-
-    return;
-  }
-  
-  String parts[4];
-  int partIndex = 0;
-  int start = 0;
-
-  for (int i = 0; i <= (int)tagText.length() && partIndex < 4; i++) {
-    if (i == (int)tagText.length() || tagText[i] == '|') {
-      parts[partIndex++] = tagText.substring(start, i);
-      start = i + 1;
-    }
-  }
-
-  if (partIndex < 4 || parts[0].length() == 0) {
-    return;
-  }
-
-  String encryptedData = parts[0];
-  String iv            = parts[1];
-  String authTag       = parts[2];
-  String date          = parts[3];
-
-  Serial.printf("[NFC] Got encrypted payload for date %s\n", date.c_str());
-  writeNFCText(" ");
-
-  // ── Get current date/time for the log ──
-  String dateStr, timeStr;
-  getDateTime(dateStr, timeStr);
-
-  // ── POST to /api/scanner/log ──
-  if (WiFi.status() != WL_CONNECTED || authToken == "") {
-    queueOfflineNFCLog(encryptedData, iv, authTag, date, dateStr, timeStr);
-    setLedSuccess();
-    return;
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(8000);
-
-  if (!http.begin(client, String(serverEndpoint) + "/api/scanner/log")) {
-    http.end();
-    return;
-  }
-
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + authToken);
-
-  StaticJsonDocument<512> doc;
-  doc["encryptedData"]    = encryptedData;
-  doc["iv"]               = iv;
-  doc["authTag"]          = authTag;
-  doc["date"]             = date;
-  doc["scanner_location"] = SCANNER_LOCATION;
-  doc["scanner_id"]       = SCANNER_ID;
-  doc["date_scanned"]     = dateStr;
-  doc["time_scanned"]     = timeStr;
-
-  String body;
-  serializeJson(doc, body);
-
-  int code = http.POST(body);
-  if (code == 201) {
-    Serial.println("[NFC] Log created successfully");
-    setLedSuccess();
-    sendOutput("NFC scan logged.", -1);
-  } else {
-    String resp = http.getString();
-    Serial.printf("[NFC] Server returned %d: %s\n", code, resp.c_str());
-    queueOfflineNFCLog(encryptedData, iv, authTag, date, dateStr, timeStr);
-  }
-  http.end();
 }
