@@ -49,6 +49,7 @@ import { spawn } from 'child_process';
 import bcryptjs from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import session from 'express-session';
+import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import crypto from 'crypto';
 import { get } from 'http';
@@ -69,6 +70,7 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
+app.use(cookieParser());
 app.use(session({
   secret: process.env.SESSION_SECRET || 'your-secret-key',
   resave: false,
@@ -513,7 +515,7 @@ const loginLimiter = rateLimit({
  * @param {express.NextFunction} next
  */
 function verifyToken(req, res, next) {
-  const token = req.session.user?.token || req.headers.authorization?.split(' ')[1];
+  const token = req.cookies.auth_token || req.session.user?.token || req.headers.authorization?.split(' ')[1];
   
   if (!token) {
     return res.status(401).json({ error: 'No authentication token provided' });
@@ -556,10 +558,8 @@ function requireRole(role) {
  * @param {express.NextFunction} next
  */
 function redirectIfNotAuthenticated(req, res, next) {
-  // Let the client-side auth.js handle redirection.
-  // The server still verifies session if present (e.g. for scanner/app logins),
-  // but won't loop-redirect for browser clients using localStorage tokens.
-  const token = req.session.user?.token || req.headers.authorization?.split(' ')[1];
+  // Check for token in: cookies (from page navigation), session, or Authorization header (from API calls)
+  const token = req.cookies.auth_token || req.session.user?.token || req.headers.authorization?.split(' ')[1];
   if (token) {
     try {
       req.user = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
@@ -2378,7 +2378,13 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       courses: Array.isArray(user.courses) ? user.courses : [],
       token: token
     };
-    req.session.user = { token };
+    // Set token as HTTP-only cookie for page navigation requests
+    res.cookie('auth_token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: 24 * 60 * 60 * 1000,
+      sameSite: 'lax'
+    });
     res.json({ 
       message: 'Login successful',
       token: token,
@@ -2405,6 +2411,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
  * @returns {200} Success message on logout.
  */
 app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('auth_token');
   req.session.destroy((err) => {
     if (err) {
       return res.status(500).json({ error: 'Could not log out' });
