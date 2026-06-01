@@ -57,7 +57,8 @@ async function initWebUsers() {
         role VARCHAR(50) NOT NULL CHECK (role IN ('teacher', 'administrator')),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        courses TEXT[] DEFAULT '{}'
+        courses TEXT[] DEFAULT '{}',
+        device_tokens TEXT[] DEFAULT '{}'
       );
     `);
     console.log('Web user table initialized.');
