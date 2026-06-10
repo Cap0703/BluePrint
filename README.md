@@ -93,3 +93,12 @@ ___
 <p align="center">
   <img width="800" alt="Contact Information" src="https://github.com/user-attachments/assets/02483a10-663f-44d3-b1e9-1cd0489b7dc7" />
 </p>
+___
+
+#AI Usage
+<p align="center">
+ AI-ASSISTED COMMENTS
+ All inline comments and JSDoc throughout the repo were generated with the
+ assistance of ChatGPT and GitHub Copilot.
+ Individual AI-generated comment blocks are tagged with @ai-generated.
+</p>
